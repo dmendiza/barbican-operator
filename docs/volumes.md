@@ -75,9 +75,15 @@ This doc briefly describes which secrets are mounted and where.
 ### secret: Barbican.Spec.KMIP.ClientDataSecret
 - contains the client certificate, key and CA bundle used to authenticate against the
   KMIP appliance
-- mounted read-only directly at Barbican.Spec.KMIP.ClientDataPath, which defaults to
-  /etc/kmip-client.  The [kmip_plugin] certfile/keyfile/ca_certs settings must point
-  into this directory and are supplied through CustomServiceConfig -- the operator only
+- mounted read-only at /var/lib/kmip-client-data-source in a kmip-client-data init
+  container, which copies the files into an emptyDir mounted at
+  Barbican.Spec.KMIP.ClientDataPath (defaults to /etc/kmip-client) and chmods them to
+  0400.  The copy is needed because barbican's KMIP plugin refuses to start unless
+  the [kmip_plugin] keyfile is mode 0400 exactly, and a Secret volume cannot provide
+  that: the pods set an fsGroup so the unprivileged barbican user can read mounted
+  Secrets, and the kubelet implements that by ORing 0440 onto every file in the
+  volume.  The [kmip_plugin] certfile/keyfile/ca_certs settings must point into
+  ClientDataPath and are supplied through CustomServiceConfig -- the operator only
   renders the [secretstore:kmip] section itself.
 - only mounted when kmip is in Barbican.Spec.EnabledSecretStores.  It is mounted in the
   barbican-api and barbican-worker pods, but not in barbican-keystone-listener.

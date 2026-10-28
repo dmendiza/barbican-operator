@@ -74,6 +74,8 @@ func Deployment(
 					ServiceAccountName:           instance.Spec.ServiceAccount,
 					SecurityContext:              pod.RestrictivePodSecurityContext(users.BarbicanUID, users.BarbicanGID),
 					Volumes:                      workerVolumes,
+					InitContainers: barbican.GetClientDataInitContainers(
+						&instance.Spec.BarbicanTemplate, instance.Spec.ContainerImage, instance.Spec.Resources),
 					Containers: []corev1.Container{
 						{
 							Name: instance.Name + "-log",

@@ -19,11 +19,13 @@ import (
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	keystonev1 "github.com/openstack-k8s-operators/keystone-operator/api/v1beta1"
 	condition "github.com/openstack-k8s-operators/lib-common/modules/common/condition"
+	"github.com/openstack-k8s-operators/lib-common/modules/users"
 	mariadb_test "github.com/openstack-k8s-operators/mariadb-operator/api/test/helpers"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 )
 
 var _ = Describe("Barbican controller", func() {
@@ -1489,6 +1491,67 @@ var _ = Describe("Barbican controller", func() {
 			for _, volumeMount := range container.VolumeMounts {
 				Expect(volumeMount.Name).ShouldNot(Equal(barbican.PKCS11ClientDataVolume))
 			}
+
+			// The service container gets the emptyDir the init container
+			// stages into, not the Secret itself -- only the init container
+			// may see the Secret, since the whole point of the copy is to
+			// drop the group-readable bit the kubelet forces onto it.
+			volumes := map[string]corev1.Volume{}
+			for _, vol := range d.Spec.Template.Spec.Volumes {
+				volumes[vol.Name] = vol
+			}
+			Expect(volumes).To(HaveKey(barbican.KMIPClientDataVolume))
+			Expect(volumes[barbican.KMIPClientDataVolume].EmptyDir).ShouldNot(BeNil())
+			Expect(volumes[barbican.KMIPClientDataVolume].Secret).Should(BeNil())
+
+			Expect(volumes).To(HaveKey(barbican.KMIPClientDataSourceVolume))
+			Expect(volumes[barbican.KMIPClientDataSourceVolume].Secret).ShouldNot(BeNil())
+			Expect(volumes[barbican.KMIPClientDataSourceVolume].Secret.SecretName).To(
+				Equal(KMIPClientDataSecret))
+
+			for _, volumeMount := range container.VolumeMounts {
+				Expect(volumeMount.Name).ShouldNot(Equal(barbican.KMIPClientDataSourceVolume))
+			}
+		})
+
+		It("Stages the KMIP client data through an init container that makes it 0400", func() {
+			// barbican's KMIP plugin refuses to start unless the keyfile is
+			// mode 0400 exactly, which a Secret volume cannot deliver under
+			// the pods' fsGroup -- see GetKMIPClientDataInitContainer.
+			keystone.SimulateKeystoneEndpointReady(barbicanTest.BarbicanKeystoneEndpoint)
+
+			BarbicanAPIExists(barbicanTest.Instance)
+
+			d := th.GetDeployment(barbicanTest.BarbicanAPIDeployment)
+			initContainers := d.Spec.Template.Spec.InitContainers
+			Expect(initContainers).To(HaveLen(1))
+
+			initContainer := initContainers[0]
+			Expect(initContainer.Name).To(Equal(barbican.KMIPClientDataInitContainer))
+			Expect(initContainer.Args).To(Equal(
+				[]string{barbican.KMIPClientDataSourcePath, KMIPClientDataPath}))
+			Expect(initContainer.Command).To(ContainElement(ContainSubstring("chmod 0400")))
+
+			// It needs the Secret to copy from and the emptyDir to copy into,
+			// and the emptyDir must be writable here or the copy fails.
+			mounts := map[string]corev1.VolumeMount{}
+			for _, volumeMount := range initContainer.VolumeMounts {
+				mounts[volumeMount.Name] = volumeMount
+			}
+			Expect(mounts).To(HaveKey(barbican.KMIPClientDataSourceVolume))
+			Expect(mounts[barbican.KMIPClientDataSourceVolume].MountPath).To(
+				Equal(barbican.KMIPClientDataSourcePath))
+			Expect(mounts[barbican.KMIPClientDataSourceVolume].ReadOnly).To(BeTrue())
+
+			Expect(mounts).To(HaveKey(barbican.KMIPClientDataVolume))
+			Expect(mounts[barbican.KMIPClientDataVolume].MountPath).To(Equal(KMIPClientDataPath))
+			Expect(mounts[barbican.KMIPClientDataVolume].ReadOnly).To(BeFalse())
+
+			// The files have to end up owned by the user barbican runs as,
+			// since 0400 leaves nobody else able to read them.
+			Expect(initContainer.SecurityContext).ShouldNot(BeNil())
+			Expect(initContainer.SecurityContext.RunAsUser).To(Equal(ptr.To(users.BarbicanUID)))
+			Expect(initContainer.SecurityContext.RunAsGroup).To(Equal(ptr.To(users.BarbicanGID)))
 		})
 
 		It("Verifies the Barbican KMIP struct is in good shape", func() {

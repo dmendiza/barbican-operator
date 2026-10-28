@@ -5,8 +5,10 @@ import (
 	"slices"
 
 	barbicanv1beta1 "github.com/openstack-k8s-operators/barbican-operator/api/v1beta1"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/pod"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/volume"
 	"github.com/openstack-k8s-operators/lib-common/modules/storage"
+	"github.com/openstack-k8s-operators/lib-common/modules/users"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -126,7 +128,7 @@ func GetScriptVolume(secretName string) corev1.Volume {
 }
 
 // getClientDataVolume returns the Volume exposing a secret store's client data
-// Secret (HSM vendor client files, KMIP certificates, ...).
+// Secret (HSM vendor client files, ...) for the stores that mount it directly.
 func getClientDataVolume(volumeName string, clientData barbicanv1beta1.ClientDataSpec) corev1.Volume {
 	return corev1.Volume{
 		Name: volumeName,
@@ -166,12 +168,109 @@ func GetClientDataVolumes(template *barbicanv1beta1.BarbicanTemplate) ([]corev1.
 	}
 
 	if slices.Contains(template.EnabledSecretStores, barbicanv1beta1.SecretStoreKMIP) && template.KMIP != nil {
-		volumes = append(volumes, getClientDataVolume(KMIPClientDataVolume, template.KMIP.ClientDataSpec))
-		mounts = append(mounts, getClientDataVolumeMount(
-			KMIPClientDataVolume, template.KMIP.ClientDataSpec, barbicanv1beta1.DefaultKMIPClientDataPath))
+		// The KMIP client data cannot be mounted from its Secret directly --
+		// see GetKMIPClientDataInitContainer. The Secret is mounted at a
+		// staging path for the init container only, and the service
+		// containers get the emptyDir the init container copies into.
+		volumes = append(volumes,
+			getKMIPClientDataSourceVolume(template.KMIP.ClientDataSpec),
+			volume.WritableDirVolume(KMIPClientDataVolume))
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      KMIPClientDataVolume,
+			MountPath: template.KMIP.PathOrDefault(barbicanv1beta1.DefaultKMIPClientDataPath),
+			ReadOnly:  true,
+		})
 	}
 
 	return volumes, mounts
+}
+
+// getKMIPClientDataSourceVolume returns the Volume exposing the KMIP client
+// data Secret at the staging path the init container copies from.
+func getKMIPClientDataSourceVolume(clientData barbicanv1beta1.ClientDataSpec) corev1.Volume {
+	return corev1.Volume{
+		Name: KMIPClientDataSourceVolume,
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				DefaultMode: &configMode,
+				SecretName:  clientData.ClientDataSecret,
+			},
+		},
+	}
+}
+
+// kmipClientDataScript copies the KMIP client data from the Secret mounted at
+// $1 into the emptyDir mounted at $2, leaving every file mode 0400 and owned
+// by the barbican user. cp -f so that an init container re-run over a
+// surviving emptyDir can overwrite the unwritable files it wrote last time,
+// and cp -L because every entry in a Secret mount is a symlink into ..data.
+const kmipClientDataScript = `set -eu
+cp -fL "$1"/* "$2"/
+chmod 0400 "$2"/*
+`
+
+// GetKMIPClientDataInitContainer returns the init container that stages the
+// KMIP client data out of its Secret and into the emptyDir mounted at
+// ClientDataPath.
+//
+// The copy exists purely to get the key file to mode 0400: barbican's KMIP
+// plugin refuses to start unless [kmip_plugin] keyfile is a regular file with
+// exactly those permissions (KMIPSecretStore._validate_keyfile_permissions).
+// A Secret volume cannot provide that -- the pods set an fsGroup so that the
+// unprivileged barbican user can read mounted Secrets, and the kubelet
+// implements that by ORing 0440 onto every file in the volume, so even
+// DefaultMode 0400 lands on disk as 0440 and barbican rejects it. Files the
+// init container writes into an emptyDir afterwards are not touched by that
+// ownership pass, so they keep both the 0400 mode and barbican's UID.
+//
+// The operator does not know which file in the Secret is the key -- the
+// [kmip_plugin] file names come from CustomServiceConfig -- so every file is
+// staged as 0400. The certificate and CA bundle are read by the same barbican
+// user, so owner-only read is enough for them too.
+func GetKMIPClientDataInitContainer(
+	template *barbicanv1beta1.BarbicanTemplate,
+	image string,
+	resources corev1.ResourceRequirements,
+) corev1.Container {
+	clientDataPath := template.KMIP.PathOrDefault(barbicanv1beta1.DefaultKMIPClientDataPath)
+	return corev1.Container{
+		Name:  KMIPClientDataInitContainer,
+		Image: image,
+		Command: []string{
+			"/bin/sh", "-c", kmipClientDataScript, KMIPClientDataInitContainer,
+		},
+		Args:            []string{KMIPClientDataSourcePath, clientDataPath},
+		SecurityContext: pod.RestrictiveSecurityContext(users.BarbicanUID, users.BarbicanGID),
+		Resources:       resources,
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      KMIPClientDataSourceVolume,
+				MountPath: KMIPClientDataSourcePath,
+				ReadOnly:  true,
+			},
+			{
+				Name:      KMIPClientDataVolume,
+				MountPath: clientDataPath,
+			},
+		},
+	}
+}
+
+// GetClientDataInitContainers returns the init containers needed to stage the
+// client data of the enabled secret stores. Only KMIP needs one; the PKCS11
+// vendor client data is mounted from its Secret directly.
+func GetClientDataInitContainers(
+	template *barbicanv1beta1.BarbicanTemplate,
+	image string,
+	resources corev1.ResourceRequirements,
+) []corev1.Container {
+	var initContainers []corev1.Container
+
+	if slices.Contains(template.EnabledSecretStores, barbicanv1beta1.SecretStoreKMIP) && template.KMIP != nil {
+		initContainers = append(initContainers, GetKMIPClientDataInitContainer(template, image, resources))
+	}
+
+	return initContainers
 }
 
 // GetCustomConfigVolume - service custom config volume

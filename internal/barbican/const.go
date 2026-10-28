@@ -71,8 +71,18 @@ const (
 	ScriptMountPoint = "/usr/local/bin/container-scripts"
 	// PKCS11ClientDataVolume is the volume used to mount PKCS11 client Data
 	PKCS11ClientDataVolume = "pkcs11-client-data"
-	// KMIPClientDataVolume is the volume used to mount KMIP client Data
+	// KMIPClientDataVolume is the emptyDir volume the KMIP client data is
+	// staged into at ClientDataPath (see GetKMIPClientDataInitContainer)
 	KMIPClientDataVolume = "kmip-client-data"
+	// KMIPClientDataSourceVolume is the Secret volume holding the KMIP client
+	// data the init container stages into KMIPClientDataVolume
+	KMIPClientDataSourceVolume = "kmip-client-data-source"
+	// KMIPClientDataSourcePath is where KMIPClientDataSourceVolume is mounted
+	// in the init container
+	KMIPClientDataSourcePath = "/var/lib/kmip-client-data-source"
+	// KMIPClientDataInitContainer is the name of the init container that
+	// stages the KMIP client data
+	KMIPClientDataInitContainer = "kmip-client-data"
 	// ACConsumerFinalizer is added to AC secrets that barbican is actively consuming
 	ACConsumerFinalizer = "openstack.org/barbican-ac-consumer"
 
